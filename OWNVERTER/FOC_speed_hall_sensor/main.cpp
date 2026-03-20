@@ -1,0 +1,793 @@
+/*
+ * Copyright (c) 2024-present LAAS-CNRS
+ *
+ *   This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU Lesser General Public License as published by
+ *   the Free Software Foundation, either version 2.1 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU Lesser General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Lesser General Public License
+ *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-License-Identifier: LGPL-2.1
+ */
+
+/**
+ * @brief  This file implements cascaded FOC for an OwnTech OwnVerter board:
+ *         an inner d/q current loop and an outer speed loop based on Hall sensors.
+ *         Please check example documentation to get more details
+ *         how to use this example: https://docs.owntech.org/examples/
+ *
+ * @author Régis Ruelland <regis.ruelland@laas.fr>
+ * @author Jean Alinei <jean.alinei@laas.fr>
+ */
+
+/* --------------OWNTECH APIs---------------------------------- */
+
+#include "ScopeMimicry.h"
+#include "SpinAPI.h"
+#include "TaskAPI.h"
+#include "ShieldAPI.h"
+#include "arm_math_types.h"
+#include "control_factory.h"
+#include "transform.h"
+#include "trigo.h"
+#include "zephyr/console/console.h"
+
+/* --------------SETUP FUNCTIONS DECLARATION------------------- */
+
+/* Setups the hardware and software of the system */
+void setup_routine();
+
+/* --------------LOOP FUNCTIONS DECLARATION-------------------- */
+
+/* Code to be executed in the background task */
+void loop_background_task();
+/* Code to be executed in real time in the critical */
+void loop_critical_task();
+void application_task();
+
+/* --------------USER VARIABLES DECLARATIONS------------------- */
+#define HALL1 PC6
+#define HALL2 PC7
+#define HALL3 PD2
+
+static const float32_t AC_CURRENT_LIMIT = 3.0;
+static const float32_t DC_CURRENT_LIMIT = 2.0;
+
+/* Control timing and startup thresholds. */
+static const float32_t MIN_DC_VOLTAGE = 30.0F;
+/* Used as a threshold to start POWER mode */
+static const float32_t V_HIGH_MIN = 5.0;
+static const float32_t Ts = 100.e-6F;
+static const uint32_t control_task_period = (uint32_t)(Ts * 1.e6F);
+/* The speed loop is intentionally 10x slower than the current loop. */
+static const uint32_t speed_loop_decimation = 10;
+static const float32_t Ts_speed = Ts * speed_loop_decimation;
+
+/* Hall effect sensors */
+static uint8_t HALL1_value;
+static uint8_t HALL2_value;
+static uint8_t HALL3_value;
+
+static uint8_t angle_index;
+static float32_t hall_angle;
+static PllAngle pllangle = controlLibFactory.pllAngle(Ts, 10.0F, 0.04F);
+static PllDatas pllDatas;
+static float32_t angle_filtered;
+static float32_t w_meas;
+
+/*
+ * One sector for one index value
+ * Index = H1*2^0 + H2*2^1 + H3*2^2
+ */
+static int16_t sector[] = {-1, 5, 1, 0, 3, 4, 2};
+static float32_t k_angle_offset = 0.0F;
+
+/* Power LEG measures */
+static float32_t meas_data;
+static float32_t I1_low_value;
+static float32_t I2_low_value;
+static float32_t I1_offset;
+static float32_t I2_offset;
+static float32_t tmpI1_offset;
+static float32_t tmpI2_offset;
+static const float32_t NB_OFFSET = 2000.0;
+static float32_t V1_low_value;
+static float32_t V2_low_value;
+static float32_t V12_value;
+
+/* DC measures */
+static float32_t I_high;
+static float32_t V_high;
+
+/* Three phase system and Park DQ Frame (dqo) */
+static three_phase_t Vabc;
+static three_phase_t duty_abc;
+static three_phase_t Iabc;
+static dqo_t Vdq;
+static dqo_t Idq;
+static dqo_t Idq_ref;
+static float32_t angle_4_control;
+
+/* Variables mirrored to ScopeMimicry for logging and tuning. */
+static three_phase_t Iabc_ref;
+static float32_t duty_a, duty_b;
+static float32_t Ia_ref;
+static float32_t Ib_ref;
+static float32_t Va;
+static float32_t Iq_meas;
+static float32_t Iq_ref;
+static float32_t Iq_max;
+static float32_t Vd, Vq;
+static float32_t speed_ref;
+static float32_t speed_ref_print;
+static float32_t speed_meas_print;
+static float32_t iq_ref_from_speed;
+static float32_t HALL1_value_f;
+static float32_t HALL2_value_f;
+static float32_t HALL3_value_f;
+static float32_t angle_index_f;
+
+/* Speed command and limits. The outer loop generates the q-axis current reference. */
+static const float32_t SPEED_REF_STEP = 10.0F;
+static const float32_t SPEED_REF_MAX = 3000.0F;
+static const float32_t IQ_REF_MAX = 5.0F;
+static const float32_t ANGLE_OFFSET_STEP = 1.0F;
+static const float32_t ANGLE_OFFSET_WRAP = 24.0F;
+
+/* Filters used on bus voltage and estimated electrical speed. */
+static LowPassFirstOrderFilter vHigh_filter =
+						controlLibFactory.lowpassfilter(Ts, 5.0e-3F);
+
+static LowPassFirstOrderFilter w_mes_filter =
+						controlLibFactory.lowpassfilter(Ts, 20.0e-3F);
+
+static float32_t V_high_filtered;
+static float32_t inverse_Vhigh;
+
+/* Inner current regulators and outer speed regulator. */
+
+static float32_t Kp = 30 * 0.035;
+static float32_t Ti = 0.002029;
+static float32_t Td = 0.0F;
+static float32_t N = 1.0;
+/* Coefficient 0.4 comes from Va_max =  (α_max - 0.5) * Udc     */
+static float32_t lower_bound = -MIN_DC_VOLTAGE * 0.4;
+static float32_t upper_bound = MIN_DC_VOLTAGE * 0.4;
+static Pid pi_d = controlLibFactory.pid(Ts, Kp, Ti, Td, N,
+										lower_bound, upper_bound);
+
+static Pid pi_q = controlLibFactory.pid(Ts, Kp, Ti, Td, N,
+										lower_bound, upper_bound);
+
+static float32_t speed_Kp = 0.001F;
+static float32_t speed_Ti = 0.08F;
+static Pid pi_speed = controlLibFactory.pid(Ts_speed, speed_Kp, speed_Ti, 0.0F, 1.0F,
+										-IQ_REF_MAX, IQ_REF_MAX);
+
+/* Scope decimation only affects logging, not control execution. */
+const static uint32_t decimation = 10;
+static uint32_t counter_time;
+float32_t counter_time_f;
+static float32_t w_estimate;
+uint8_t received_serial_char;
+
+/* List of possible modes for the OwnTech power shield */
+enum serial_interface_menu_mode
+{
+	IDLEMODE = 0,
+	POWERMODE = 1,
+};
+
+/* List of possible control states */
+enum control_state_mode {
+	OFFSET_ST = 0,
+	IDLE_ST = 1,
+	POWER_ST = 2,
+	ERROR_ST = 3
+};
+
+enum control_state_mode control_state;
+static float32_t control_state_f;
+
+static uint16_t error_counter;
+static bool pwm_enable;
+uint8_t asked_mode = IDLEMODE;
+
+/* ScopeMimicry capture state and helpers. */
+
+const uint16_t SCOPE_SIZE = 512;
+uint16_t k_app_idx;
+ScopeMimicry scope(SCOPE_SIZE, 12);
+static bool is_downloading;
+static bool memory_print;
+
+bool mytrigger()
+{
+	return (control_state == POWER_ST);
+}
+
+void dump_scope_datas(ScopeMimicry &scope) {
+	printk("begin record\n");
+	scope.reset_dump();
+	while (scope.get_dump_state() != finished) {
+		printk("%s", scope.dump_datas());
+		task.suspendBackgroundUs(200);
+	}
+	printk("end record\n");
+}
+
+/**
+ * Reset estimator, filters and controller states.
+ */
+void init_filt_and_reg(void)
+{
+	pllangle.reset(0.F);
+	vHigh_filter.reset(V_HIGH_MIN);
+	w_mes_filter.reset(0.F);
+	pi_d.reset();
+	pi_q.reset();
+	pi_speed.reset();
+	error_counter = 0;
+}
+
+/**
+ * @brief Estimate electrical speed from Hall-sector transitions.
+ * Each sector step corresponds to pi/3 electrical radians.
+ *
+ * @param sector assume sector is integer in [0, 5]
+ * @param time in [s]
+ * @return estimated electrical speed in rad/s
+ */
+float32_t pulsation_estimator(int16_t sector, float32_t time)
+{
+	static const float32_t speed_timeout = 0.05F;
+	static float32_t w_estimate_intern = 0.0F;
+	static int16_t prev_sector = -1;
+	static float32_t prev_time = 0.0F;
+	static bool is_initialized = false;
+	int16_t delta_sector;
+	float32_t sixty_degre_step_time;
+
+	if (!is_initialized) {
+		prev_sector = sector;
+		prev_time = time;
+		is_initialized = true;
+		return 0.0F;
+	}
+
+	delta_sector = sector - prev_sector;
+	if (delta_sector == 1 || delta_sector == -5) {
+		/* positive speed */
+		sixty_degre_step_time = (time - prev_time);
+		if (sixty_degre_step_time > 0.0F) {
+			w_estimate_intern = (PI / 3.0F) / sixty_degre_step_time;
+		}
+		prev_time = time;
+		prev_sector = sector;
+	}
+	else if (delta_sector == -1 || delta_sector == 5) {
+		sixty_degre_step_time = (time - prev_time);
+		if (sixty_degre_step_time > 0.0F) {
+			w_estimate_intern = (-PI / 3.0F) / sixty_degre_step_time;
+		}
+		prev_time = time;
+		prev_sector = sector;
+	}
+	else if (delta_sector == 0) {
+		if ((time - prev_time) > speed_timeout) {
+			w_estimate_intern = 0.0F;
+		}
+	}
+	else {
+		/* Ignore impossible Hall jumps, but do not keep stale speed forever. */
+		if ((time - prev_time) > speed_timeout) {
+			w_estimate_intern = 0.0F;
+		}
+		prev_sector = sector;
+	}
+	return w_estimate_intern;
+}
+
+/**
+ * Retrieve the latest sensor values and update filtered quantities.
+ */
+inline void retrieve_analog_datas()
+{
+	meas_data = shield.sensors.getLatestValue(I1_LOW);
+	if (meas_data != NO_VALUE) {
+		I1_low_value = meas_data + I1_offset;
+	}
+
+	meas_data = shield.sensors.getLatestValue(I2_LOW);
+	if (meas_data != NO_VALUE) {
+		I2_low_value = meas_data + I2_offset;
+	}
+
+	if (control_state == OFFSET_ST && counter_time < NB_OFFSET) {
+		tmpI1_offset += I1_low_value;
+		tmpI2_offset += I2_low_value;
+	}
+
+	meas_data = shield.sensors.getLatestValue(V_HIGH);
+	if (meas_data != NO_VALUE) {
+		V_high = meas_data;
+	}
+
+	meas_data = shield.sensors.getLatestValue(I_HIGH);
+	if (meas_data != NO_VALUE) {
+		/* Sign is negative because of the way hardware sensor is routed */
+		I_high = -meas_data;
+	}
+
+	meas_data = shield.sensors.getLatestValue(V1_LOW);
+	if (meas_data != NO_VALUE) {
+		V1_low_value = meas_data;
+	}
+
+	meas_data = shield.sensors.getLatestValue(V2_LOW);
+	if (meas_data != NO_VALUE) {
+		V2_low_value = meas_data;
+	}
+
+	/* Vhigh measurement gets additional filtering */
+	V_high_filtered = vHigh_filter.calculateWithReturn(V_high);
+
+	V12_value = V1_low_value - V2_low_value;
+}
+
+/**
+ * Read Hall sensors and estimate electrical angle and speed.
+ */
+inline void get_position_and_speed()
+{
+	static const float32_t invalid_hall_angle = 0.0F;
+	/* Read individual Hall sensor states. */
+	HALL1_value = spin.gpio.readPin(HALL1);
+	HALL2_value = spin.gpio.readPin(HALL2);
+	HALL3_value = spin.gpio.readPin(HALL3);
+	/* Build the Hall state index used to look up the electrical sector. */
+	angle_index = HALL1_value * 1 + HALL2_value * 2 + HALL3_value * 4;
+
+	if (angle_index >= 7U || sector[angle_index] < 0) {
+		hall_angle = invalid_hall_angle;
+		w_estimate = 0.0F;
+		pllDatas = pllangle.calculateWithReturn(hall_angle);
+		angle_filtered = pllDatas.angle;
+		w_meas = w_mes_filter.calculateWithReturn(0.0F);
+		return;
+	}
+
+	hall_angle =
+			ot_modulo_2pi(PI / 3.0 * sector[angle_index] +
+			PI * k_angle_offset / 24.0);
+
+	w_estimate = pulsation_estimator(sector[angle_index], counter_time * Ts);
+	pllDatas = pllangle.calculateWithReturn(hall_angle);
+
+	angle_filtered = pllDatas.angle;
+	w_meas = w_mes_filter.calculateWithReturn(pllDatas.w);
+}
+
+/**
+ * Count repeated overcurrent events and latch the error state if needed.
+ */
+inline void overcurrent_mngt()
+{
+	if (I1_low_value > AC_CURRENT_LIMIT || I1_low_value < -AC_CURRENT_LIMIT ||
+	    I2_low_value > AC_CURRENT_LIMIT || I2_low_value < -AC_CURRENT_LIMIT ||
+	    I_high > DC_CURRENT_LIMIT) {
+		error_counter++;
+	}
+	if (error_counter > 10) {
+		control_state = ERROR_ST;
+	}
+}
+
+/**
+ * Stop PWM and clear controller state when leaving closed-loop operation.
+ */
+inline void stop_pwm_and_reset_states_ifnot()
+{
+	if (pwm_enable == true) {
+		shield.power.stop(ALL);
+		/* Reset filters and pid */
+		init_filt_and_reg();
+		pwm_enable = false;
+	}
+}
+
+/**
+ * Restart current-sensor offset calibration from a clean stopped state.
+ */
+inline void restart_offset_calibration()
+{
+	stop_pwm_and_reset_states_ifnot();
+	counter_time = 0;
+	I1_offset = 0.0F;
+	I2_offset = 0.0F;
+	tmpI1_offset = 0.0F;
+	tmpI2_offset = 0.0F;
+	asked_mode = IDLEMODE;
+	control_state = OFFSET_ST;
+	spin.led.turnOn();
+}
+
+/**
+ * Run cascaded control:
+ * - the speed PI executes every `speed_loop_decimation` current-loop ticks
+ * - the current PIs execute every critical-task period
+ */
+inline void control_speed()
+{
+	angle_4_control = angle_filtered;
+	/* Hold the previous q-axis current reference between speed-loop updates. */
+	if ((counter_time % speed_loop_decimation) == 0U) {
+		iq_ref_from_speed = pi_speed.calculateWithReturn(speed_ref, w_meas);
+	}
+	Idq_ref.q = iq_ref_from_speed;
+
+	/* Saturation */
+	if (Idq_ref.q > Iq_max) {
+		Idq_ref.q = Iq_max;
+	}
+	if (Idq_ref.q < -Iq_max) {
+		Idq_ref.q = -Iq_max;
+	}
+
+	Idq_ref.d = 0.0F;
+	Iabc.a = I1_low_value;
+	Iabc.b = I2_low_value;
+	Iabc.c = -(Iabc.a + Iabc.b);
+
+	Idq = Transform::to_dqo(Iabc, angle_4_control);
+	Vdq.d = pi_d.calculateWithReturn(Idq_ref.d, Idq.d);
+	Vdq.q = pi_q.calculateWithReturn(Idq_ref.q, Idq.q);
+	Vdq.o = 0.0F;
+
+	Vabc = Transform::to_threephase(Vdq, angle_4_control);
+}
+
+/**
+ * Convert commanded phase voltages into PWM duty cycles.
+ */
+inline void compute_duties()
+{
+	if (V_high_filtered > V_HIGH_MIN) {
+		inverse_Vhigh = 1.0F / V_high_filtered;
+	}
+	else {
+		inverse_Vhigh = 1.0F / MIN_DC_VOLTAGE;
+	}
+	duty_abc.a = (Vabc.a * inverse_Vhigh + 0.5);
+	duty_abc.b = (Vabc.b * inverse_Vhigh + 0.5);
+	duty_abc.c = (Vabc.c * inverse_Vhigh + 0.5);
+}
+
+/**
+ * Apply the computed duty cycles to the three power legs.
+ */
+inline void apply_duties()
+{
+	shield.power.setDutyCycle(LEG1, duty_abc.a);
+	shield.power.setDutyCycle(LEG2, duty_abc.b);
+	shield.power.setDutyCycle(LEG3, duty_abc.c);
+}
+
+/**
+ * Start the PWM outputs once when entering power mode.
+ */
+void start_pwms_ifnot()
+{
+	if (!pwm_enable) {
+		pwm_enable = true;
+		shield.power.start(ALL);
+	}
+}
+
+/**
+ * Initialize runtime variables before the first control activation.
+ */
+void init_variables()
+{
+	/* Time counter */
+	counter_time = 0;
+	/* Measurements variables */
+	I1_low_value = 0.0F;
+	I2_low_value = 0.0F;
+	I_high = 0.0F;
+	V_high = 0.0F;
+	/* Offset variables */
+	I1_offset = 0.0F;
+	I2_offset = 0.0F;
+	tmpI1_offset = 0.0F;
+	tmpI2_offset = 0.0F;
+	/* State view of the pwm */
+	pwm_enable = false;
+	/* Idle or power mode*/
+	asked_mode = IDLEMODE;
+	/* We begin to measure the current offset before all */
+	control_state = IDLE_ST;
+	Iq_max = IQ_REF_MAX;
+	speed_ref = 0.0F;
+	speed_ref_print = 0.0F;
+	speed_meas_print = 0.0F;
+	iq_ref_from_speed = 0.0F;
+	restart_offset_calibration();
+}
+/* --------------SETUP FUNCTIONS------------------------------- */
+
+/**
+ * In this setup routine :
+ *  - Power shield is initialized
+ * 		- Shield is set in Buck Mode.
+ * 		- Default sensors are activated
+ * 		- GPIOs are set for Hall effect sensor
+ *  - ScopeMimicry is initialized
+ * 	- VHigh filter and PIDs are initialized
+ * 	- LED is turned on.
+ *  - Tasks are initialized and started
+ */
+void setup_routine()
+{
+	/* Setup the hardware first */
+	shield.power.initBuck(ALL);
+	shield.sensors.enableDefaultOwnverterSensors();
+
+	spin.gpio.configurePin(HALL1, INPUT);
+	spin.gpio.configurePin(HALL2, INPUT);
+	spin.gpio.configurePin(HALL3, INPUT);
+
+	/* Scope configuration */
+	scope.connectChannel(V12_value, "V12_value");           /* 0 */
+	scope.connectChannel(Vq, "Vq");                         /* 1 */
+	scope.connectChannel(Vd, "Vd");                         /* 2 */
+	scope.connectChannel(I1_low_value, "I1_low_value");     /* 3 */
+	scope.connectChannel(I2_low_value, "I2_low_value");     /* 4 */
+	scope.connectChannel(I_high, "I_high_value");     	    /* 5 */
+	scope.connectChannel(Iq_meas, "Iq_meas");               /* 6 */
+	scope.connectChannel(speed_meas_print, "speed_meas");   /* 7 */
+	scope.connectChannel(speed_ref_print, "speed_ref");     /* 8 */
+	scope.connectChannel(hall_angle, "hall_angle");         /* 9 */
+	scope.connectChannel(angle_filtered, "angle_filtered"); /* 10 */
+	scope.connectChannel(control_state_f, "control_state"); /* 11 */
+	scope.set_trigger(&mytrigger);
+	scope.set_delay(0.0);
+	scope.start();
+
+	/* Initialize values */
+	init_filt_and_reg();
+	init_variables();
+	spin.led.turnOn();
+
+	/* Declare tasks */
+	uint32_t background_task_number =
+					task.createBackground(loop_background_task);
+
+	uint32_t app_task_number = task.createBackground(application_task);
+	task.createCritical(loop_critical_task, control_task_period);
+
+	/* Finally, start tasks */
+	task.startBackground(background_task_number);
+	task.startBackground(app_task_number);
+	task.startCritical();
+}
+
+/* --------------LOOP FUNCTIONS-------------------------------- */
+
+/**
+ * Poll USB serial commands:
+ * - P / I: enter power mode or idle mode
+ * - U / D: increase or decrease the speed reference
+ * - O: restart current-offset calibration
+ * - J / K: decrease or increase the electrical angle offset
+ * - R / Q / M: control ScopeMimicry data capture and replay
+ */
+void loop_background_task()
+{
+	received_serial_char = console_getchar();
+	switch (received_serial_char) {
+	case 'p':
+		printk("power asked");
+		asked_mode = POWERMODE;
+		scope.start();
+		break;
+	case 'i':
+		printk("idle asked");
+		asked_mode = IDLEMODE;
+		speed_ref = 0.0F;
+		break;
+	case 'o':
+		printk("offset recalibration asked");
+		restart_offset_calibration();
+		break;
+	case 'r':
+		is_downloading = true;
+		break;
+	case 'u':
+		speed_ref += SPEED_REF_STEP;
+		if (speed_ref > SPEED_REF_MAX) {
+			speed_ref = SPEED_REF_MAX;
+		}
+		break;
+	case 'd':
+		speed_ref -= SPEED_REF_STEP;
+		if (speed_ref < -SPEED_REF_MAX) {
+			speed_ref = -SPEED_REF_MAX;
+		}
+		break;
+	case 'j':
+		k_angle_offset -= ANGLE_OFFSET_STEP;
+		if (k_angle_offset <= -ANGLE_OFFSET_WRAP) {
+			k_angle_offset += 2.0F * ANGLE_OFFSET_WRAP;
+		}
+		printk("angle offset: %.2f\n", (double)k_angle_offset);
+		break;
+	case 'k':
+		k_angle_offset += ANGLE_OFFSET_STEP;
+		if (k_angle_offset > ANGLE_OFFSET_WRAP) {
+			k_angle_offset -= 2.0F * ANGLE_OFFSET_WRAP;
+		}
+		printk("angle offset: %.2f\n", (double)k_angle_offset);
+		break;
+	case 'm':
+		/* To print scope datas in ownplot as soon as possible */
+		memory_print = !memory_print;
+		break;
+	case 'q':
+		/* Relaunch scope acquisition */
+		scope.start();
+		break;
+	}
+}
+
+/**
+ * Stream status data over USB serial and handle scope dumps.
+ */
+void application_task()
+{
+	if (!memory_print) {
+		int16_t printed_hall_sector = -1;
+
+		if (angle_index < 7U && sector[angle_index] >= 0) {
+			printed_hall_sector = sector[angle_index];
+		}
+
+		printk("%7.2f", (double)V_high);
+		printk("%7.2f:", (double)Iq_meas);
+		printk("%7.2f:", (double)Iq_max);
+		printk("%7.2f:", (double)speed_ref);
+		printk("%7.2f:", (double)w_meas);
+		printk("%7.2f:", (double)k_angle_offset);
+		printk("%7.2f:", (double)I1_offset);
+		printk("%7d:", control_state);
+		printk("%7d:", angle_index);
+		printk("%7d\n", printed_hall_sector);
+
+	} else {
+		/* Replay the scope buffer continuously over serial for live plotting tools.
+		 */
+		k_app_idx = (k_app_idx + 1) % SCOPE_SIZE;
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 0));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 1));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 2));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 3));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 4));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 5));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 6));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 7));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 8));
+		printk("%.2f:", scope.get_channel_value(k_app_idx, 9));
+		printk("\n");
+	}
+
+	if (is_downloading) {
+		dump_scope_datas(scope);
+		is_downloading = false;
+	}
+	switch (control_state) {
+	case OFFSET_ST:
+		if (counter_time > (uint32_t)NB_OFFSET) {
+			spin.led.turnOff();
+			I1_offset = -tmpI1_offset / NB_OFFSET;
+			I2_offset = -tmpI2_offset / NB_OFFSET;
+			control_state = IDLE_ST;
+		}
+		break;
+
+	case IDLE_ST:
+		if ((asked_mode == POWERMODE) && (V_high_filtered > V_HIGH_MIN)) {
+			control_state = POWER_ST;
+		}
+		break;
+
+	case POWER_ST:
+		if (asked_mode == IDLEMODE) {
+			control_state = IDLE_ST;
+		}
+		break;
+
+	case ERROR_ST:
+		if (asked_mode == IDLEMODE) {
+			error_counter = 0;
+			control_state = IDLE_ST;
+		}
+		break;
+	}
+
+	task.suspendBackgroundMs(250);
+}
+
+
+/**
+ * Critical 10 kHz task:
+ * - acquire measurements and Hall state
+ * - update the cascaded control loops
+ * - apply PWM duties
+ */
+void loop_critical_task()
+{
+	counter_time++;
+
+	retrieve_analog_datas();
+
+	get_position_and_speed();
+
+	overcurrent_mngt();
+
+	switch (control_state) {
+	case OFFSET_ST:
+		stop_pwm_and_reset_states_ifnot();
+		break;
+	case IDLE_ST:
+		stop_pwm_and_reset_states_ifnot();
+		break;
+	case ERROR_ST:
+		stop_pwm_and_reset_states_ifnot();
+		break;
+	case POWER_ST:
+		/* Closed-loop speed/current control runs only in power mode. */
+		control_speed();
+		compute_duties();
+		apply_duties();
+		start_pwms_ifnot();
+		break;
+	}
+
+	/* Decimate scope acquisition to keep logging bandwidth reasonable. */
+	if (counter_time % decimation == 0) {
+		angle_index_f = angle_index;
+		Va = Vabc.a;
+		duty_a = duty_abc.a;
+		duty_b = duty_abc.b;
+		Iq_ref = Idq_ref.q;
+		Iq_meas = Idq.q;
+		Vd = Vdq.d;
+		Vq = Vdq.q;
+		speed_ref_print = speed_ref;
+		speed_meas_print = w_meas;
+		Iabc_ref = Transform::to_threephase(Idq_ref, angle_4_control);
+		Ia_ref = Iabc_ref.a;
+		Ib_ref = Iabc_ref.b;
+		counter_time_f = (float32_t)counter_time;
+		HALL1_value_f = HALL1_value;
+		HALL2_value_f = HALL2_value;
+		HALL3_value_f = HALL3_value;
+		control_state_f = control_state;
+		scope.acquire();
+	}
+}
+
+int main(void)
+{
+	setup_routine();
+
+	return 0;
+}
+
