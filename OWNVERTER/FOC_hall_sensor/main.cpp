@@ -53,8 +53,8 @@ void loop_critical_task();
 void application_task();
 
 /* --------------USER VARIABLES DECLARATIONS------------------- */
-#define HALL1 PA7
-#define HALL2 PC6
+#define HALL1 PC6
+#define HALL2 PC7
 #define HALL3 PD2
 
 static const float32_t AC_CURRENT_LIMIT = 3.0;
@@ -77,14 +77,12 @@ static float32_t hall_angle;
 static PllAngle pllangle = controlLibFactory.pllAngle(Ts, 10.0F, 0.04F);
 static PllDatas pllDatas;
 static float32_t angle_filtered;
-static float32_t w_meas;
 
 /*
  * One sector for one index value
  * Index = H1*2^0 + H2*2^1 + H3*2^2
  */
 static int16_t sector[] = {-1, 5, 1, 0, 3, 4, 2};
-static float32_t k_angle_offset = 0.0F;
 
 /* Power LEG measures */
 static float32_t meas_data;
@@ -97,7 +95,6 @@ static float32_t tmpI2_offset;
 static const float32_t NB_OFFSET = 2000.0;
 static float32_t V1_low_value;
 static float32_t V2_low_value;
-static float32_t V12_value;
 
 /* DC measures */
 static float32_t I_high;
@@ -113,10 +110,7 @@ static dqo_t Idq_ref;
 static float32_t angle_4_control;
 
 /* Variables used to get static value for ScopeMimicry */
-static three_phase_t Iabc_ref;
 static float32_t duty_a, duty_b;
-static float32_t Ia_ref;
-static float32_t Ib_ref;
 static float32_t Va;
 static float32_t Iq_meas;
 static float32_t Iq_ref;
@@ -134,9 +128,6 @@ static float32_t manual_Iq_ref;
  * Low Pass Filters Init
  */
 static LowPassFirstOrderFilter vHigh_filter =
-						controlLibFactory.lowpassfilter(Ts, 5.0e-3F);
-
-static LowPassFirstOrderFilter w_mes_filter =
 						controlLibFactory.lowpassfilter(Ts, 5.0e-3F);
 
 static float32_t V_high_filtered;
@@ -163,8 +154,6 @@ static Pid pi_q = controlLibFactory.pid(Ts, Kp, Ti, Td, N,
 /* Decimation is used to limit the rate of measurement plotted in ScopeMimicry*/
 const static uint32_t decimation = 10;
 static uint32_t counter_time;
-float32_t counter_time_f;
-static float32_t w_estimate;
 uint8_t received_serial_char;
 
 /* List of possible modes for the OwnTech power shield */
@@ -196,7 +185,7 @@ uint8_t asked_mode = IDLEMODE;
 
 const uint16_t SCOPE_SIZE = 512;
 uint16_t k_app_idx;
-ScopeMimicry scope(SCOPE_SIZE, 12);
+ScopeMimicry scope(SCOPE_SIZE, 10);
 static bool is_downloading;
 static bool memory_print;
 
@@ -225,37 +214,6 @@ void init_filt_and_reg(void)
 	pi_d.reset();
 	pi_q.reset();
 	error_counter = 0;
-}
-
-/**
- * @brief A period-meter function which estimate pulsation
- * for the sector variable (one integer value correspond to π/3).
- *
- * @param sector assume sector is integer in [0, 5]
- * @param time in [s]
- * @return pulsation (float)
- */
-float32_t pulsation_estimator(int16_t sector, float32_t time)
-{
-	static float32_t w_estimate_intern = 0.0F;
-	static int16_t prev_sector;
-	static float32_t prev_time = 0.0F;
-	int16_t delta_sector;
-	float32_t sixty_degre_step_time;
-	delta_sector = sector - prev_sector;
-	prev_sector = sector;
-	if (delta_sector == 1 || delta_sector == -5) {
-		/* positive speed */
-		sixty_degre_step_time = (time - prev_time);
-		w_estimate_intern = (PI / 3.0) / sixty_degre_step_time;
-		prev_time = time;
-	}
-	if (delta_sector == -1 || delta_sector == 5) {
-		sixty_degre_step_time = (time - prev_time);
-		w_estimate_intern = (-PI / 3.0) / sixty_degre_step_time;
-		prev_time = time;
-	}
-	return w_estimate_intern;
 }
 
 /**
@@ -301,8 +259,6 @@ inline void retrieve_analog_datas()
 
 	/* Vhigh measurement gets additional filtering */
 	V_high_filtered = vHigh_filter.calculateWithReturn(V_high);
-
-	V12_value = V1_low_value - V2_low_value;
 }
 
 /**
@@ -315,17 +271,12 @@ inline void get_position_and_speed()
 	HALL2_value = spin.gpio.readPin(HALL2);
 	HALL3_value = spin.gpio.readPin(HALL3);
 	/* We compute angle index using HALL values. */
-	angle_index = HALL3_value * 4 + HALL2_value * 2 + HALL1_value * 1;
+	angle_index = HALL1_value * 1 + HALL2_value * 2 + HALL3_value * 4;
 
-	hall_angle =
-			ot_modulo_2pi(PI / 3.0 * sector[angle_index] +
-			PI * k_angle_offset / 24.0);
-
-	w_estimate = pulsation_estimator(sector[angle_index], counter_time * Ts);
+	hall_angle = ot_modulo_2pi(PI / 3.0 * sector[angle_index]);
 	pllDatas = pllangle.calculateWithReturn(hall_angle);
 
 	angle_filtered = pllDatas.angle;
-	w_meas = w_mes_filter.calculateWithReturn(pllDatas.w);
 }
 
 /**
@@ -338,7 +289,7 @@ inline void overcurrent_mngt()
 	    I_high > DC_CURRENT_LIMIT) {
 		error_counter++;
 	}
-	if (error_counter > 2) {
+	if (error_counter > 1000) {
 		control_state = ERROR_ST;
 	}
 }
@@ -354,6 +305,22 @@ inline void stop_pwm_and_reset_states_ifnot()
 		init_filt_and_reg();
 		pwm_enable = false;
 	}
+}
+
+/**
+ * Reset current offset estimation and re-enter offset calibration state.
+ */
+inline void restart_offset_calibration()
+{
+	stop_pwm_and_reset_states_ifnot();
+	counter_time = 0;
+	I1_offset = 0.0F;
+	I2_offset = 0.0F;
+	tmpI1_offset = 0.0F;
+	tmpI2_offset = 0.0F;
+	asked_mode = IDLEMODE;
+	control_state = OFFSET_ST;
+	spin.led.turnOn();
 }
 
 /**
@@ -440,9 +407,10 @@ void init_variables()
 	/* Idle or power mode*/
 	asked_mode = IDLEMODE;
 	/* We begin to measure the current offset before all */
-	control_state = OFFSET_ST;
+	control_state = IDLE_ST;
 	Iq_max = 2.0;
 	manual_Iq_ref = 0.0F;
+	restart_offset_calibration();
 }
 /* --------------SETUP FUNCTIONS------------------------------- */
 
@@ -468,18 +436,16 @@ void setup_routine()
 	spin.gpio.configurePin(HALL3, INPUT);
 
 	/* Scope configuration */
-	scope.connectChannel(V12_value, "V12_value");           /* 0 */
-	scope.connectChannel(Vq, "Vq");                         /* 1 */
-	scope.connectChannel(Vd, "Vd");                         /* 2 */
-	scope.connectChannel(I1_low_value, "I1_low_value");     /* 3 */
-	scope.connectChannel(I2_low_value, "I2_low_value");     /* 4 */
-	scope.connectChannel(I_high, "I_high_value");     	    /* 5 */
-	scope.connectChannel(Iq_meas, "Iq_meas");               /* 6 */
-	scope.connectChannel(angle_filtered, "angle_filtered"); /* 7 */
-	scope.connectChannel(Ib_ref, "Ib_ref");                 /* 8 */
-	scope.connectChannel(hall_angle, "hall_angle");         /* 9 */
-	scope.connectChannel(Ia_ref, "Ia_ref");                 /* 10 */
-	scope.connectChannel(control_state_f, "control_state"); /* 11 */
+	scope.connectChannel(Vq, "Vq");                         /* 0 */
+	scope.connectChannel(Vd, "Vd");                         /* 1 */
+	scope.connectChannel(I1_low_value, "I1_low_value");     /* 2 */
+	scope.connectChannel(I2_low_value, "I2_low_value");     /* 3 */
+	scope.connectChannel(I_high, "I_high_value");           /* 4 */
+	scope.connectChannel(Iq_meas, "Iq_meas");               /* 5 */
+	scope.connectChannel(angle_filtered, "angle_filtered"); /* 6 */
+	scope.connectChannel(Iq_ref, "Iq_ref");                 /* 7 */
+	scope.connectChannel(hall_angle, "hall_angle");         /* 8 */
+	scope.connectChannel(control_state_f, "control_state"); /* 9 */
 	scope.set_trigger(&mytrigger);
 	scope.set_delay(0.0);
 	scope.start();
@@ -508,6 +474,7 @@ void setup_routine()
  * This background task retrieve user inputs to control the OwnVerter:
  * - P and I keys respectively Power ON and Power OFF the inverter
  * - U and D keys respectively Increase and Decrease Iq reference.
+ * - O key relaunches current offset calibration.
  * - R Q and M keys are used to control ScopeMimicry data retrieval.
  */
 void loop_background_task()
@@ -522,6 +489,10 @@ void loop_background_task()
 	case 'i':
 		printk("idle asked");
 		asked_mode = IDLEMODE;
+		break;
+	case 'o':
+		printk("offset recalibration asked");
+		restart_offset_calibration();
 		break;
 	case 'r':
 		is_downloading = true;
@@ -549,11 +520,13 @@ void application_task()
 {
 	if (!memory_print) {
 		printk("%7.2f", V_high);
-		printk("%7.2f:", k_angle_offset);
 		printk("%7.2f:", Iq_max);
 		printk("%7.2f:", manual_Iq_ref);
 		printk("%7.2f:", I1_offset);
-		printk("%7d\n", control_state);
+		printk("%7d:", control_state);
+		printk("%7d:", angle_index);
+		printk("%7d\n", sector[angle_index]);
+
 	} else {
 		/* If memory_print is true then we plot scope datas in an infinite loop
 		 * This can be used with ownplot if you have not python script installed
@@ -569,8 +542,7 @@ void application_task()
 		printk("%.2f:", scope.get_channel_value(k_app_idx, 6));
 		printk("%.2f:", scope.get_channel_value(k_app_idx, 7));
 		printk("%.2f:", scope.get_channel_value(k_app_idx, 8));
-		printk("%.2f:", scope.get_channel_value(k_app_idx, 9));
-		printk("\n");
+		printk("%.2f\n", scope.get_channel_value(k_app_idx, 9));
 	}
 
 	if (is_downloading) {
@@ -654,10 +626,6 @@ void loop_critical_task()
 		Iq_meas = Idq.q;
 		Vd = Vdq.d;
 		Vq = Vdq.q;
-		Iabc_ref = Transform::to_threephase(Idq_ref, angle_4_control);
-		Ia_ref = Iabc_ref.a;
-		Ib_ref = Iabc_ref.b;
-		counter_time_f = (float32_t)counter_time;
 		HALL1_value_f = HALL1_value;
 		HALL2_value_f = HALL2_value;
 		HALL3_value_f = HALL3_value;
@@ -672,4 +640,3 @@ int main(void)
 
 	return 0;
 }
-
